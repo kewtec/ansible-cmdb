@@ -2,15 +2,13 @@ import sys
 import re
 import json
 import traceback
+import logging
 if sys.version_info[0] == 2:
     # Python 2.x shlex doesn't support unicode
     import ushlex as shlex
 else:
     import shlex
-try:
-    import yaml
-except ImportError as err:
-    import yaml3 as yaml
+from . import ihateyaml
 
 
 class HostsParser(object):
@@ -23,6 +21,7 @@ class HostsParser(object):
     def __init__(self, hosts_contents):
         self.hosts_contents = hosts_contents
         self.hosts = {}
+        self.log = logging.getLogger(__name__)
 
         # Get a list of host, children and vars sections in the hosts file
         try:
@@ -44,11 +43,9 @@ class HostsParser(object):
                 self._apply_section(section, self.hosts)
             for section in filter(lambda s: s['type'] == 'hosts', self.sections):
                 self._apply_section(section, self.hosts)
-        except ValueError as err:
+        except ValueError:
             tb = traceback.format_exc()
-            sys.stderr.write("Error while parsing hosts contents: '{}'\n"
-                             "Invalid hosts file?\n".format(tb))
-
+            self.log.warn("Error while parsing hosts contents: '{0}'. Invalid hosts file?".format(tb))
 
     def _parse_hosts_contents(self, hosts_contents):
         """
@@ -161,7 +158,11 @@ class HostsParser(object):
         else:
             tokens = shlex.split(line.strip())
             name = tokens.pop(0)
-            key_values = self._parse_vars(tokens)
+            try:
+                key_values = self._parse_vars(tokens)
+            except ValueError:
+                self.log.warning("Unsupported vars syntax. Skipping line: {0}".format(line))
+                return (name, {})
         return (name, key_values)
 
     def _parse_line_vars(self, line):
@@ -178,7 +179,7 @@ class HostsParser(object):
         k, v = line.strip().split('=', 1)
         if v.startswith('['):
             try:
-                list_res = yaml.load(v)
+                list_res = ihateyaml.safe_load(v)
                 if isinstance(list_res[0], dict):
                     key_values = list_res[0]
                     return key_values
@@ -202,7 +203,7 @@ class HostsParser(object):
         """
         key_values = {}
         for token in tokens:
-            if token == '#':
+            if token.startswith('#'):
                 # End parsing if we encounter a comment, which lasts
                 # until the end of the line.
                 break
@@ -319,7 +320,7 @@ class HostsParser(object):
             # partially expanded host(s) gets added back to the todo list.
             while hosts_todo:
                 host = hosts_todo.pop(0)
-                if not '[' in host:
+                if '[' not in host:
                     hosts_done.append(host)
                     continue
 
@@ -354,7 +355,7 @@ class HostsParser(object):
             # Strip port numbers off and return
             return [host_name.split(':')[0] for host_name in hosts_done]
         except Exception as e:
-            sys.stderr.write("Couldn't parse host definition '{}': {}\n".format(hostdef, e))
+            self.log.warning("Couldn't parse host definition '{0}': {1}".format(hostdef, e))
             return []
 
 
@@ -366,6 +367,7 @@ class DynInvParser(object):
         self.dynvinv_contents = dynvinv_contents
         self.hosts = {}
         self.dynvinv_json = json.loads(self.dynvinv_contents)
+        self.log = logging.getLogger(__name__)
 
         for k, v in self.dynvinv_json.items():
             if k.startswith('_meta'):
@@ -385,7 +387,7 @@ class DynInvParser(object):
         """
         Get an existing host or otherwise initialize a new empty one.
         """
-        if not hostname in self.hosts:
+        if hostname not in self.hosts:
             self.hosts[hostname] = {
                 'groups': set(),
                 'hostvars': {}
@@ -398,18 +400,35 @@ class DynInvParser(object):
         elements which are not '_meta(data)'.
         """
         if type(group) == dict:
+            # Example:
+            #     {
+            #       "mgmt": {
+            #         "hosts": [ "mgmt01", "mgmt02" ],
+            #         "vars": {
+            #           "eth0": {
+            #             "onboot": "yes",
+            #             "nm_controlled": "no"
+            #           }
+            #         }
+            #       }
+            #     }
+            #
+            hostnames_in_group = set()
+
             # Group member with hosts and variable definitions.
             for hostname in group.get('hosts', []):
                 self._get_host(hostname)['groups'].add(group_name)
+                hostnames_in_group.add(hostname)
+            # Apply variables to all hosts in group
             for var_key, var_val in group.get('vars', {}).items():
-                self._get_host(hostname)['hostvars'][var_key] = var_val
+                for hostname in hostnames_in_group:
+                    self._get_host(hostname)['hostvars'][var_key] = var_val
         elif type(group) == list:
             # List of hostnames for this group
             for hostname in group:
                 self._get_host(hostname)['groups'].add(group_name)
         else:
-            sys.stderr.write("Invalid element found in dynamic "
-                             "inventory output: {}".format(type(group)))
+            self.log.warning("Invalid element found in dynamic inventory output: {0}".format(type(group)))
 
     def _parse_meta(self, meta):
         """
